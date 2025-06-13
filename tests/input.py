@@ -231,5 +231,4 @@ with col_info:
     transcript_box.text_area("Transcript", value=st.session_state.transcript, height=200)
     if st.session_state.emotions:
         emotion_box.write(", ".join(st.session_state.emotions[-50:]))
-    else:
-        emotion_box.write("No emotions yet.")
+    else:emotion_box.write("No emotions yet.")
