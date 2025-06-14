@@ -1,2 +1,6 @@
 venv
 vosk-model-small-en-us-0.15
+my_env/
+__pycache__/
+*.pyc
+temp_audio.wav
