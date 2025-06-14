@@ -1,430 +1,263 @@
-# # main_app.py
+import gradio as gr
+import cv2
+import numpy as np
+import mediapipe as mp
+import tempfile, os, wave, json
+import scipy.io.wavfile as wavfile
+import requests
+from vosk import Model, KaldiRecognizer
 
-# import streamlit as st
-# import torch
-# import time
-# from datetime import datetime
+# -------------- Emotion detector (from emotion_detector.py) --------------
+mp_face = mp.solutions.face_mesh
+# For frame-based detection we set static_image_mode=False, but since we process individual frames, static_image_mode=True also works.
+face_mesh = mp_face.FaceMesh(
+    static_image_mode=True,
+    max_num_faces=1,
+    refine_landmarks=True,
+    min_detection_confidence=0.5
+)
 
-# # Existing utilities; adjust import paths if needed
-# from llm_utils2 import load_model, generate_response, get_smart_fallback
-# from chat_utils2 import build_prompt, truncate_history, validate_response
-# from voice_utils import get_voice_processor
+def get_landmarks(frame):
+    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    results = face_mesh.process(rgb)
+    if not results.multi_face_landmarks:
+        return None
+    lm = results.multi_face_landmarks[0].landmark
+    h, w, _ = frame.shape
+    coords = np.array([[p.x * w, p.y * h] for p in lm], dtype=np.float32)
+    return coords
 
-# # Emotion detector: ensure module name matches your file
-# from emotion_classifier import detect_emotion_from_frame
+def mouth_aspect_ratio(lm):
+    left, right = lm[61], lm[291]
+    top, bottom = lm[13], lm[14]
+    width = np.linalg.norm(right - left)
+    height = np.linalg.norm(top - bottom)
+    return 0.0 if width == 0 else height / width
 
-# # For video+audio streaming
-# from streamlit_webrtc import webrtc_streamer, VideoProcessorBase, WebRtcMode
+def eye_aspect_ratio(lm, left=True):
+    if left:
+        upper, lower = lm[159], lm[145]
+        corner1, corner2 = lm[33], lm[133]
+    else:
+        upper, lower = lm[386], lm[374]
+        corner1, corner2 = lm[263], lm[362]
+    vert = np.linalg.norm(upper - lower)
+    hor = np.linalg.norm(corner2 - corner1)
+    return 0.0 if hor == 0 else vert / hor
 
-# import av
-# import numpy as np
-# import soundfile as sf
-# import tempfile
-# import os
-# import speech_recognition as sr
+def eyebrow_distance(lm):
+    return np.linalg.norm(lm[70] - lm[300])
 
-# st.set_page_config(
-#     page_title="Soul Sync Chat v2.1",
-#     layout="centered",
-#     initial_sidebar_state="expanded"
-# )
+def mouth_corner_slope(lm):
+    left, right = lm[61], lm[291]
+    dx = right[0] - left[0]
+    dy = right[1] - left[1]
+    return 0.0 if dx == 0 else dy / dx
 
-# # --- Helper functions defined first ---
+def detect_emotion_from_frame(frame,
+                              thresh_smile=0.035,
+                              thresh_surprise=0.25,
+                              thresh_anger=0.05,
+                              thresh_sad_slope=0.02) -> str | None:
+    lm = get_landmarks(frame)
+    if lm is None:
+        return None
+    # Happy
+    if mouth_aspect_ratio(lm) > thresh_smile:
+        return "happy"
+    # Surprised
+    ear = (eye_aspect_ratio(lm, True) + eye_aspect_ratio(lm, False)) / 2.0
+    if ear > thresh_surprise:
+        return "surprised"
+    # Angry
+    face_width = np.linalg.norm(lm[234] - lm[454])
+    if face_width > 0 and eyebrow_distance(lm) < thresh_anger * face_width:
+        return "angry"
+    # Sad
+    if mouth_corner_slope(lm) > thresh_sad_slope:
+        return "sad"
+    return "neutral"
 
-# def detect_emotion_from_text(text: str) -> str:
-#     """Simple keyword-based emotion detection."""
-#     t = text.lower()
-#     if any(w in t for w in ["happy","great","awesome","love","excited"]):
-#         return "happy"
-#     if any(w in t for w in ["sad","upset","hurt","cry","terrible"]):
-#         return "sad"
-#     if any(w in t for w in ["angry","mad","hate","frustrated","annoyed"]):
-#         return "angry"
-#     if any(w in t for w in ["confused","don't understand","unclear","lost"]):
-#         return "confused"
-#     if text.count('!') >= 2:
-#         return "excited"
-#     if text.count('?') >= 2:
-#         return "confused"
-#     return "neutral"
+# -------------- Vosk ASR setup --------------
+# Make sure you have downloaded a Vosk model, e.g.:
+#   wget https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip
+#   unzip to ./models/vosk-model-small-en-us-0.15
+VOSK_MODEL_PATH = "models/vosk-model-small-en-us-0.15"  # adjust path as needed
+if not os.path.isdir(VOSK_MODEL_PATH):
+    raise RuntimeError(f"Vosk model not found at {VOSK_MODEL_PATH}. Download and unzip a Vosk model there.")
+vosk_model = Model(VOSK_MODEL_PATH)
 
-# def export_chat() -> str:
-#     """Export chat history as plain text."""
-#     lines = []
-#     lines.append(f"Soul Sync Chat Export - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-#     lines.append("="*50)
-#     for i, (u,b,emotion,timing) in enumerate(st.session_state.messages, 1):
-#         lines.append(f"\nExchange {i}:")
-#         lines.append(f"User ({emotion}): {u}")
-#         lines.append(f"Bot: {b}")
-#         lines.append(f"Response time: {timing.get('total_time',0):.2f}s")
-#         lines.append("-"*30)
-#     return "\n".join(lines)
+def transcribe_with_vosk(audio_path: str) -> str:
+    """
+    Given a WAV file path, run Vosk ASR and return the transcription.
+    Assumes WAV is PCM 16-bit mono.
+    """
+    wf = wave.open(audio_path, "rb")
+    if wf.getnchannels() != 1 or wf.getsampwidth() != 2:
+        # Need 16-bit mono PCM. If not, we could convert—but for simplicity, require WAV from numpy to be mono 16kHz.
+        # Alternatively, convert here with ffmpeg or so, but we assume sample rate 16000 and mono.
+        pass
+    rec = KaldiRecognizer(vosk_model, wf.getframerate())
+    rec.SetWords(False)
+    text_parts = []
+    while True:
+        data = wf.readframes(4000)
+        if len(data) == 0:
+            break
+        if rec.AcceptWaveform(data):
+            res = json.loads(rec.Result())
+            if "text" in res:
+                text_parts.append(res["text"])
+    # final
+    resf = json.loads(rec.FinalResult())
+    if "text" in resf:
+        text_parts.append(resf["text"])
+    wf.close()
+    return " ".join(text_parts).strip()
 
-# def process_message(
-#     user_input: str,
-#     voice_enabled: bool,
-#     voice_processor,
-#     voice_speed: float,
-#     tokenizer,
-#     model,
-#     device,
-#     max_tokens: int,
-#     temperature: float,
-#     top_p: float,
-#     top_k: int,
-#     debug_mode: bool,
-#     model_name: str,
-#     external_emotion: str = None
-# ):
-#     """Process user message, possibly with external_emotion from video capture."""
-#     start_time = time.time()
-#     timing = {}
+def transcribe_audio_numpy(audio_data):
+    """
+    audio_data: (sample_rate, np.ndarray)
+    We write to a temp WAV with 16-bit PCM, mono, resample to 16000 if needed.
+    """
+    if audio_data is None:
+        return ""
+    sample_rate, arr = audio_data  # arr: shape (n,) or (n,2)
+    # If stereo, convert to mono by averaging channels
+    if arr.ndim == 2:
+        arr = arr.mean(axis=1)
+    # Resample to 16000 if needed
+    target_sr = 16000
+    if sample_rate != target_sr:
+        try:
+            import librosa
+            arr = librosa.resample(arr.astype(float), orig_sr=sample_rate, target_sr=target_sr)
+            sample_rate = target_sr
+        except ImportError:
+            # If librosa not installed, fallback: skip resample (may reduce accuracy)
+            pass
+    # Convert float to int16 if needed
+    if arr.dtype.kind == 'f':
+        arr16 = (arr * 32767).astype(np.int16)
+    else:
+        arr16 = arr.astype(np.int16)
+    fd, path = tempfile.mkstemp(suffix=".wav")
+    os.close(fd)
+    wavfile.write(path, sample_rate, arr16)
+    # Transcribe
+    try:
+        text = transcribe_with_vosk(path)
+    except Exception as e:
+        text = f"[Vosk ASR error: {e}]"
+    finally:
+        try: os.remove(path)
+        except: pass
+    return text
 
-#     # Determine emotion: prefer external_emotion if provided
-#     if external_emotion:
-#         emotion = external_emotion
-#     else:
-#         emotion = detect_emotion_from_text(user_input)
+# -------------- Video frame extraction & emotion aggregation --------------
+def extract_emotions_from_video(video_path: str, frame_interval_sec: float = 1.0):
+    """
+    OpenCV read video, sample one frame every frame_interval_sec, detect emotion.
+    Return dict emotion->count.
+    """
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise RuntimeError(f"Cannot open video: {video_path}")
+    fps = cap.get(cv2.CAP_PROP_FPS) or 24.0
+    step = int(fps * frame_interval_sec)
+    if step < 1:
+        step = 1
+    emotion_counts = {}
+    idx = 0
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        if idx % step == 0:
+            emo = detect_emotion_from_frame(frame) or "no_face"
+            emotion_counts[emo] = emotion_counts.get(emo, 0) + 1
+        idx += 1
+    cap.release()
+    return emotion_counts
 
-#     # Build prompt
-#     with st.spinner("Thinking..."):
-#         t0 = time.time()
-#         history = st.session_state.conversation_history if use_history else []
-#         prompt = build_prompt(history, user_input, emotion_label=emotion, model_type=model_name, tokenizer=tokenizer)
-#         timing['prompt_time'] = time.time() - t0
+def pick_dominant_emotion(emotion_counts: dict) -> str:
+    if not emotion_counts:
+        return "no_face_detected"
+    # If only no_face
+    if len(emotion_counts) == 1 and "no_face" in emotion_counts:
+        return "no_face_detected"
+    # Exclude no_face if others exist
+    filtered = {e: c for e, c in emotion_counts.items() if e != "no_face"}
+    if not filtered:
+        return "no_face_detected"
+    return max(filtered.items(), key=lambda x: x[1])[0]
 
-#         # Generate response
-#         t1 = time.time()
-#         response = generate_response(
-#             prompt=prompt,
-#             tokenizer=tokenizer,
-#             model=model,
-#             device=device,
-#             max_new_tokens=max_tokens,
-#             temperature=temperature,
-#             top_p=top_p,
-#             top_k=top_k,
-#             history=history,
-#             user_input=user_input,
-#             emotion=emotion
-#         )
-#         timing['inference_time'] = time.time() - t1
+# -------------- Send to local Gemini server --------------
+def send_to_server(text: str, emotion: str) -> str:
+    """
+    Sends JSON {"text":..., "emotion":...} to localhost:8000 via POST.
+    Expects server returns JSON with e.g. {"reply": "..."} or plain text.
+    """
+    url = "http://localhost:8000"
+    payload = {"text": text, "emotion": emotion}
+    try:
+        resp = requests.post(url, json=payload, timeout=10)
+        # Try to parse JSON
+        try:
+            j = resp.json()
+            # assume reply field
+            if isinstance(j, dict) and "reply" in j:
+                return j["reply"]
+            else:
+                # return entire JSON as string
+                return json.dumps(j)
+        except Exception:
+            # fallback to plain text
+            return resp.text
+    except Exception as e:
+        return f"[Request to server failed: {e}]"
 
-#         # Validate
-#         t2 = time.time()
-#         is_valid, final_response = validate_response(response, user_input, emotion)
-#         if not is_valid or not final_response:
-#             final_response = get_smart_fallback(user_input, emotion)
-#         timing['cleaning_time'] = time.time() - t2
+# -------------- Main processing function --------------
+def process(video_path, audio_data):
+    """
+    1. Extract frames every 1s from video_path, detect emotions, pick dominant.
+    2. Transcribe audio_data via Vosk.
+    3. Send to local server and return reply.
+    """
+    # 1. Emotion
+    try:
+        counts = extract_emotions_from_video(video_path, frame_interval_sec=1.0)
+        dominant = pick_dominant_emotion(counts)
+    except Exception as e:
+        dominant = f"[Emotion error: {e}]"
+    # 2. Transcription
+    try:
+        text = transcribe_audio_numpy(audio_data)
+    except Exception as e:
+        text = f"[Transcription error: {e}]"
+    # 3. Send to server
+    reply = send_to_server(text, dominant)
+    return dominant, text, reply
 
-#     # Voice output
-#     if voice_enabled and voice_processor and final_response:
-#         try:
-#             with st.spinner("Speaking..."):
-#                 voice_processor.text_to_speech(final_response, speed=voice_speed)
-#         except Exception as e:
-#             if debug_mode:
-#                 st.error(f"Voice output failed: {e}")
+# -------------- Gradio UI --------------
+def main():
+    with gr.Blocks() as demo:
+        gr.Markdown("## Emotion-aware capture + send to local server\n"
+                    "Click **Start Recording** to record a short clip (video+audio). After stopping, we:\n"
+                    "1. Extract snapshots (one frame per second) and detect emotion.\n"
+                    "2. Transcribe audio via Vosk.\n"
+                    "3. Send `{text, emotion}` to `http://localhost:8000` and display response.\n")
+        with gr.Row():
+            video_in = gr.Video(source="webcam", label="Record video (will auto-capture snapshots)")
+            audio_in = gr.Audio(source="microphone", type="numpy", label="Record audio")
+        emotion_out = gr.Textbox(label="Detected Dominant Emotion", interactive=False)
+        transcript_out = gr.Textbox(label="Transcription", interactive=False)
+        reply_out = gr.Textbox(label="Server Reply", interactive=False)
+        submit = gr.Button("Submit")
+        submit.click(fn=process,
+                     inputs=[video_in, audio_in],
+                     outputs=[emotion_out, transcript_out, reply_out])
+    demo.launch()
 
-#     timing['total_time'] = time.time() - start_time
-
-#     # Update history
-#     st.session_state.conversation_history.append((user_input, final_response))
-#     st.session_state.messages.append((user_input, final_response, emotion, timing))
-
-#     # Truncate if too long
-#     st.session_state.conversation_history = truncate_history(
-#         st.session_state.conversation_history,
-#         tokenizer,
-#         max_tokens=800
-#     )
-
-#     # Rerun to display updated chat
-#     st.rerun()
-
-
-# # --- Sidebar and settings ---
-
-# st.sidebar.header("🎛️ Configuration")
-
-# # Only DialoGPT-medium and DialoGPT-large
-# model_options = {
-#     "DialoGPT Medium (355M)": "microsoft/DialoGPT-medium",
-#     "DialoGPT Large (774M)": "microsoft/DialoGPT-large"
-# }
-# selected_model_label = st.sidebar.selectbox(
-#     "Choose Model", list(model_options.keys()), index=0
-# )
-# model_name = model_options[selected_model_label]
-
-# # Context/history toggle
-# use_history = st.sidebar.checkbox("Include chat history in prompt?", value=True)
-
-# # Debug mode
-# debug_mode = st.sidebar.checkbox("🐛 Debug Mode", value=False)
-# st.session_state.debug_mode = debug_mode
-
-# # Voice settings
-# st.sidebar.header("🎤 Voice Settings")
-# try:
-#     voice_processor = get_voice_processor()  # may require Vosk model path if using offline ASR
-#     voice_enabled = st.sidebar.checkbox("Enable Voice Input/Output", value=False)
-#     if voice_enabled:
-#         voice_speed = st.sidebar.slider("Voice Speed", 0.5, 2.0, 1.0, 0.1)
-#     else:
-#         voice_speed = 1.0
-# except Exception:
-#     st.sidebar.warning("Voice not available: install/configure dependencies")
-#     voice_processor = None
-#     voice_enabled = False
-#     voice_speed = 1.0
-
-# # Video settings
-# st.sidebar.header("📹 Video Settings")
-# video_enabled = st.sidebar.checkbox("Enable Video Emotion Capture", value=False)
-# if video_enabled:
-#     st.sidebar.markdown(
-#         "- Click **Start Video** below to begin webcam emotion capture.\n"
-#         "- Speak while video is on; click **Done Recording** when finished."
-#     )
-
-# # Generation settings
-# st.sidebar.header("⚙️ Generation Settings")
-# col1, col2 = st.sidebar.columns(2)
-# with col1:
-#     temperature = st.slider("Temperature", 0.6, 1.2, 0.8, 0.1)
-#     top_k = st.slider("Top-k", 30, 100, 50, 10)
-# with col2:
-#     top_p = st.slider("Top-p", 0.7, 0.95, 0.9, 0.05)
-#     max_tokens = st.number_input("Max tokens", 20, 150, 50, 10)
-
-# # Load model with caching
-# @st.cache_resource
-# def init_model(name: str):
-#     return load_model(name)
-
-# try:
-#     with st.spinner(f"Loading {selected_model_label}..."):
-#         tokenizer, model, device = init_model(model_name)
-#     st.sidebar.success(f"Model loaded on {device}")
-#     if torch.cuda.is_available():
-#         mem = torch.cuda.memory_allocated() / 1024**3
-#         st.sidebar.info(f"GPU Memory: {mem:.1f} GB")
-# except Exception as e:
-#     st.sidebar.error(f"Failed to load model: {e}")
-#     if debug_mode:
-#         st.exception(e)
-#     st.stop()
-
-# # Session state init
-# if "messages" not in st.session_state:
-#     st.session_state.messages = []
-# if "conversation_history" not in st.session_state:
-#     st.session_state.conversation_history = []
-
-# # For video/audio capture accumulation
-# if "video_frames" not in st.session_state:
-#     st.session_state.video_frames = []
-# if "audio_frames" not in st.session_state:
-#     st.session_state.audio_frames = []
-# if "webrtc_ctx" not in st.session_state:
-#     st.session_state.webrtc_ctx = None
-# if "recording" not in st.session_state:
-#     st.session_state.recording = False
-
-# # --- Main UI ---
-
-# st.title("🤖 Soul Sync Chat")
-# st.markdown("*Emotion-aware chatbot with voice & video cue capture*")
-
-# # Display chat history
-# st.header("💬 Conversation")
-# chat_container = st.container()
-# with chat_container:
-#     for (user_msg, bot_msg, emotion, timing) in st.session_state.messages:
-#         # User
-#         with st.chat_message("user"):
-#             emoji = {
-#                 "happy":"😊","sad":"😢","angry":"😠","frustrated":"😤",
-#                 "confused":"🤔","excited":"🤩","anxious":"😰","tired":"😴"
-#             }.get(emotion, "💬")
-#             st.write(f"{emoji} {user_msg}")
-#             if debug_mode:
-#                 st.caption(f"Emotion: {emotion} | Time: {timing.get('total_time',0):.2f}s")
-#         # Bot
-#         with st.chat_message("assistant"):
-#             st.write(bot_msg)
-
-# # --- Video + Audio capture section ---
-# if video_enabled:
-#     st.subheader("📹 Video & Audio Input")
-
-#     class EmotionProcessor(VideoProcessorBase):
-#         def __init__(self):
-#             self.frame_count = 0
-
-#         def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
-#             img = frame.to_ndarray(format="bgr24")
-#             emotion = detect_emotion_from_frame(img)
-#             label = emotion or "No face"
-#             import cv2
-#             cv2.putText(img, label, (30,30),
-#                         cv2.FONT_HERSHEY_SIMPLEX, 1, (0,255,0), 2)
-#             st.session_state.video_frames.append(img.copy())
-#             return av.VideoFrame.from_ndarray(img, format="bgr24")
-
-#     col_start, col_done = st.columns(2)
-#     if col_start.button("▶️ Start Video"):
-#         st.session_state.video_frames = []
-#         st.session_state.audio_frames = []
-#         st.session_state.recording = True
-#         ctx = webrtc_streamer(
-#             key="emotion-webrtc",
-#             mode=WebRtcMode.SENDRECV,
-#             video_processor_factory=EmotionProcessor,
-#             rtc_configuration={"iceServers":[{"urls":["stun:stun.l.google.com:19302"]}]},
-#             media_stream_constraints={"video": True, "audio": True},
-#             async_processing=True,
-#         )
-#         st.session_state.webrtc_ctx = ctx
-
-#     if col_done.button("⏹️ Done Recording"):
-#         st.session_state.recording = False
-#         ctx = st.session_state.webrtc_ctx
-#         if ctx:
-#             ctx.stop()
-#         # Process video frames for dominant emotion
-#         emotions = []
-#         for frame in st.session_state.video_frames:
-#             em = detect_emotion_from_frame(frame)
-#             if em:
-#                 emotions.append(em)
-#         dominant_emotion = max(set(emotions), key=emotions.count) if emotions else "neutral"
-#         st.session_state.captured_emotion = dominant_emotion
-#         st.success(f"Captured dominant emotion: {dominant_emotion}")
-
-#         # Process audio via SpeechRecognition
-#         transcription = ""
-#         if ctx and ctx.audio_receiver:
-#             audio_chunks = []
-#             while True:
-#                 try:
-#                     audio_frame = ctx.audio_receiver.recv(timeout=1.0)
-#                     arr = audio_frame.to_ndarray()
-#                     audio_chunks.append(arr)
-#                 except Exception:
-#                     break
-#             st.session_state.audio_frames = audio_chunks
-
-#             if st.session_state.audio_frames:
-#                 try:
-#                     # Assume sample rate 48000 if unknown
-#                     sample_rate = ctx.audio_receiver.buffer[0].format.sample_rate \
-#                                   if ctx.audio_receiver and ctx.audio_receiver.buffer else 48000
-#                     # Convert to mono
-#                     mono = []
-#                     for arr in st.session_state.audio_frames:
-#                         if arr.ndim > 1:
-#                             mono_frame = arr.mean(axis=0)
-#                         else:
-#                             mono_frame = arr
-#                         mono.append(mono_frame)
-#                     full_audio = np.concatenate(mono)
-#                     tmp_wav = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
-#                     sf.write(tmp_wav.name, full_audio, sample_rate)
-#                     recognizer = sr.Recognizer()
-#                     with sr.AudioFile(tmp_wav.name) as source:
-#                         audio_data = recognizer.record(source)
-#                     try:
-#                         transcription = recognizer.recognize_google(audio_data)
-#                         st.success("Transcribed speech via Google")
-#                     except Exception:
-#                         try:
-#                             transcription = recognizer.recognize_sphinx(audio_data)
-#                             st.success("Transcribed speech via Sphinx")
-#                         except Exception:
-#                             st.warning("Could not transcribe audio")
-#                     finally:
-#                         tmp_wav.close()
-#                         os.unlink(tmp_wav.name)
-#                 except Exception as e:
-#                     if debug_mode:
-#                         st.error(f"Audio transcription failed: {e}")
-#         else:
-#             st.info("No audio captured")
-
-#         st.session_state.captured_transcription = transcription
-#         if transcription:
-#             st.write(f"Transcription: {transcription}")
-#             process_message(
-#                 transcription,
-#                 voice_enabled, voice_processor, voice_speed,
-#                 tokenizer, model, device,
-#                 max_tokens, temperature, top_p, top_k,
-#                 debug_mode, model_name,
-#                 external_emotion=st.session_state.captured_emotion
-#             )
-
-# # --- Chat input section ---
-# if not video_enabled or not st.session_state.get("recording", False):
-#     if voice_enabled:
-#         st.subheader("🎤 Voice Input")
-#         col1, col2 = st.columns([1,1])
-#         with col1:
-#             if st.button("Start Voice Recording"):
-#                 try:
-#                     audio_text = voice_processor.record_and_transcribe()
-#                     if audio_text:
-#                         st.session_state.temp_voice_input = audio_text
-#                         st.success(f"Transcribed: {audio_text}")
-#                     else:
-#                         st.warning("No speech detected")
-#                 except Exception as e:
-#                     st.error(f"Recording failed: {e}")
-#         with col2:
-#             if st.button("Use Voice Input"):
-#                 if st.session_state.get("temp_voice_input"):
-#                     user_input = st.session_state.pop("temp_voice_input")
-#                     process_message(
-#                         user_input,
-#                         voice_enabled, voice_processor, voice_speed,
-#                         tokenizer, model, device,
-#                         max_tokens, temperature, top_p, top_k,
-#                         debug_mode, model_name
-#                     )
-#     if user_input := st.chat_input("Type your message here..."):
-#         process_message(
-#             user_input,
-#             voice_enabled, voice_processor, voice_speed,
-#             tokenizer, model, device,
-#             max_tokens, temperature, top_p, top_k,
-#             debug_mode, model_name
-#         )
-
-# # Sidebar stats & controls
-# if st.session_state.messages:
-#     st.sidebar.header("📊 Session Stats")
-#     num = len(st.session_state.messages)
-#     emotions = [m[2] for m in st.session_state.messages]
-#     dominant = max(set(emotions), key=emotions.count) if emotions else "neutral"
-#     times = [m[3].get('total_time',0) for m in st.session_state.messages]
-#     avg_t = sum(times)/len(times) if times else 0
-#     st.sidebar.metric("Messages", num)
-#     st.sidebar.metric("Dominant Emotion", dominant.title())
-#     st.sidebar.metric("Avg Response Time", f"{avg_t:.2f}s")
-
-# st.sidebar.header("🔧 Controls")
-# col1, col2 = st.sidebar.columns(2)
-# with col1:
-#     if st.button("🗑️ Clear Chat"):
-#         st.session_state.messages = []
-#         st.session_state.conversation_history = []
-#         st.rerun()
-# with col2:
-#     if st.button("💾 Export Chat"):
-#         if st.session_state.messages:
-#             txt = export_chat()
-#             st.download_button("Download Chat", txt, "soul_sync_chat.txt", "text/plain")
-# st.sidebar.markdown("---")
-# st.sidebar.markdown("**Soul Sync v2.1**")
+if __name__ == "__main__":
+    main()
