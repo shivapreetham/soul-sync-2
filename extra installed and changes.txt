@@ -1,0 +1,22 @@
+gradio
+librosa
+pyaudio
+
+
+removed numpy 2.2.6 and added
+removed numpy tensorflow tensorflow-intel soundfile and added
+gradio==5.34.0 opencv-python==4.11.0.86 mediapipe==0.10.21 vosk==0.3.45 soundfile==0.12.1 pyaudio==0.2.14 requests==2.32.3
+changed video script(gradio 5.0 but prev script used 4.0)
+ 
+
+
+updated
+
+gradio==5.34.0
+opencv-python==4.11.0.86
+mediapipe==0.10.21
+vosk==0.3.45
+numpy==1.23.5
+soundfile==0.12.1
+pyaudio==0.2.14
+requests==2.32.3
