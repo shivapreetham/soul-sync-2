@@ -1,4 +1,4 @@
-#this is working
+#this is working - takes audio and video together and gives transcript,emotion and response 
 import gradio as gr
 import cv2
 import mediapipe as mp
