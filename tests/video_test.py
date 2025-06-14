@@ -1,4 +1,5 @@
 import gradio as gr
+import numpy as np
 
 def process(video_path, audio_data):
     """
@@ -6,24 +7,24 @@ def process(video_path, audio_data):
     - video_path: local path to the recorded video file (mp4/webm)
     - audio_data: tuple (sample_rate, np.ndarray) from microphone recording
     """
-    # For demo, we just return them so Gradio shows playback widgets.
     return video_path, audio_data
 
 def main():
-    # Using legacy inputs/outputs so it works on Gradio v5.33.2
-    video_input = gr.inputs.Video(source="webcam", label="Record a short video")
-    audio_input = gr.inputs.Audio(source="microphone", type="numpy", label="Record audio")
-    video_output = gr.outputs.Video(label="Playback Video")
-    audio_output = gr.outputs.Audio(label="Playback Audio")
-
-    iface = gr.Interface(
-        fn=process,
-        inputs=[video_input, audio_input],
-        outputs=[video_output, audio_output],
-        title="Gradio Recording Demo (legacy API)",
-        description="Record video and audio, then playback."
-    )
-    iface.launch()
+    with gr.Blocks(title="Gradio Recording Demo") as demo:
+        gr.Markdown("**Record video and audio, then click Submit to play back.**")
+        with gr.Row():
+            video_input = gr.Video(sources="webcam", label="Record a short video")
+            audio_input = gr.Audio(sources="microphone", type="numpy", label="Record audio")
+        with gr.Row():
+            video_output = gr.Video(label="Playback Video")
+            audio_output = gr.Audio(label="Playback Audio")
+        submit = gr.Button("Submit")
+        submit.click(
+            fn=process,
+            inputs=[video_input, audio_input],
+            outputs=[video_output, audio_output]
+        )
+    demo.launch()
 
 if __name__ == "__main__":
     main()
